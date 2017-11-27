@@ -4,8 +4,9 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
 	ws "github.com/gorilla/websocket"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/pkg/api/v1"
 	"kubernetes-realtime-logs/client"
 )
@@ -15,12 +16,19 @@ type LogController struct {
 }
 
 type LogMeta struct {
-	Namespace     string `json:"namespace"`
+	Namespace     string            `json:"namespace"`
+	Timestamps    bool              `json:"timestamps"`
+	SinceSeconds  *int64            `json:"since"`
+	TailLines     *int64            `json:"tail"`
+	Selector      map[string]string `json:"selector,omitempty"`
+	podName       string
+	containerName string
+}
+
+type NotifyInfo struct {
 	PodName       string `json:"pod"`
 	ContainerName string `json:"container"`
-	Timestamps    bool   `json:"timestamps"`
-	SinceSeconds  *int64 `json:"since"`
-	TailLines     *int64 `json:"tail"`
+	Log           string `json:"log"`
 }
 
 func NewLogController(c *client.K8sClient) *LogController {
@@ -31,48 +39,86 @@ func NewLogController(c *client.K8sClient) *LogController {
 
 func (lc *LogController) ServeRequest(ws *ws.Conn) error {
 
-	var logMeta LogMeta
+	logMeta := LogMeta{
+		SinceSeconds: newInt64(120),
+		TailLines:    newInt64(100),
+	}
 
 	err := ws.ReadJSON(&logMeta)
 	if err != nil {
-		fmt.Printf("Failed to parse request message.%v\n", err)
 		return errors.New("Failed to parse request message.")
 	}
 
-	if logMeta.SinceSeconds == nil {
-		logMeta.SinceSeconds = newInt64(120)
+	listOptions := meta_v1.ListOptions{
+		LabelSelector: labels.FormatLabels(logMeta.Selector),
 	}
 
-	if logMeta.TailLines == nil {
-		logMeta.TailLines = newInt64(100)
-	}
-
-	req := lc.k8sClient.WatchLogs(logMeta.Namespace, logMeta.PodName, &v1.PodLogOptions{
-		Follow:       true,
-		Timestamps:   logMeta.Timestamps,
-		Container:    logMeta.ContainerName,
-		SinceSeconds: logMeta.SinceSeconds,
-		TailLines:    logMeta.TailLines,
-	})
-
-	stream, err := req.Stream()
+	pods, err := lc.k8sClient.ListPods(logMeta.Namespace, listOptions)
 	if err != nil {
-		fmt.Printf("Error opening stream to %s/%s: %s\n", logMeta.Namespace, logMeta.PodName, logMeta.ContainerName)
-		return errors.New(fmt.Sprintf("Error opening stream to %s/%s: %s\n", logMeta.Namespace, logMeta.PodName, logMeta.ContainerName))
+		return errors.New("Failed to list pods.")
 	}
-	defer stream.Close()
 
-	closeChan := make(chan int)
-	defer close(closeChan)
+	if len(pods.Items) == 0 {
+		return errors.New("Failed to find related pods.")
+	}
+
+	notifyChan := make(chan NotifyInfo)
+	closeChanList := make([]chan bool, 0)
+	for i := 0; i < len(pods.Items); i++ {
+		pod := pods.Items[i]
+		for j := 0; j < len(pod.Spec.Containers); j++ {
+			logMeta.podName = pod.Name
+			logMeta.containerName = pod.Spec.Containers[j].Name
+			closeChan := make(chan bool)
+			closeChanList = append(closeChanList, closeChan)
+			go lc.listenToOnePod(logMeta, notifyChan, closeChan)
+		}
+	}
 
 	go func() {
 		for {
 			_, _, err := ws.ReadMessage()
 			if err != nil {
 				fmt.Println("Conn is closed by client.")
-				stream.Close()
+				for i := 0; i < len(closeChanList); i++ {
+					closeChanList[i] <- true
+				}
 				return
 			}
+		}
+	}()
+
+	for {
+		select {
+		case n := <-notifyChan:
+			ws.WriteJSON(n)
+		}
+	}
+
+	return nil
+}
+
+func (lc *LogController) listenToOnePod(logMeta LogMeta, notifyChan chan NotifyInfo, closeChan chan bool) {
+	req := lc.k8sClient.WatchLogs(logMeta.Namespace, logMeta.podName, &v1.PodLogOptions{
+		Follow:       true,
+		Timestamps:   logMeta.Timestamps,
+		Container:    logMeta.containerName,
+		SinceSeconds: logMeta.SinceSeconds,
+		TailLines:    logMeta.TailLines,
+	})
+
+	stream, err := req.Stream()
+	if err != nil {
+		fmt.Printf("Error opening stream to %s/%s: %s\n", logMeta.Namespace, logMeta.podName, logMeta.containerName)
+		return
+	}
+	defer stream.Close()
+
+	fmt.Printf("listening to %s/%s: %s\n", logMeta.Namespace, logMeta.podName, logMeta.containerName)
+	go func() {
+		finish := <-closeChan
+		if finish {
+			stream.Close()
 		}
 	}()
 
@@ -81,15 +127,15 @@ func (lc *LogController) ServeRequest(ws *ws.Conn) error {
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
-			ws.Close()
-			return nil
+			fmt.Printf("return from %s/%s: %s\n", logMeta.Namespace, logMeta.podName, logMeta.containerName)
+			return
 		}
-		err = ws.WriteMessage(websocket.TextMessage, line)
-		if err != nil {
-			return nil
+		notifyChan <- NotifyInfo{
+			PodName:       logMeta.podName,
+			ContainerName: logMeta.containerName,
+			Log:           string(line),
 		}
 	}
-	return nil
 }
 
 func newInt64(val int64) *int64 {

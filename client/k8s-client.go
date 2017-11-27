@@ -1,6 +1,7 @@
 package client
 
 import (
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8s "k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/rest"
@@ -31,4 +32,8 @@ func NewK8sClient() *K8sClient {
 
 func (c *K8sClient) WatchLogs(namespace string, podName string, options *v1.PodLogOptions) *rest.Request {
 	return c.clientset.CoreV1Client.Pods(namespace).GetLogs(podName, options)
+}
+
+func (c *K8sClient) ListPods(namespace string, options meta_v1.ListOptions) (*v1.PodList, error) {
+	return c.clientset.CoreV1Client.Pods(namespace).List(options)
 }

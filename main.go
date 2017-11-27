@@ -41,6 +41,8 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 	defer ws.Close()
 
-	logController.ServeRequest(ws)
-
+	err = logController.ServeRequest(ws)
+	if err != nil {
+		fmt.Printf(err.Error())
+	}
 }
