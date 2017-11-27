@@ -75,6 +75,7 @@ func (lc *LogController) ServeRequest(ws *ws.Conn) error {
 		}
 	}
 
+	closeChan := make(chan bool)
 	go func() {
 		for {
 			_, _, err := ws.ReadMessage()
@@ -82,6 +83,7 @@ func (lc *LogController) ServeRequest(ws *ws.Conn) error {
 				fmt.Println("Conn is closed by client.")
 				for i := 0; i < len(closeChanList); i++ {
 					closeChanList[i] <- true
+					closeChan <- true
 				}
 				return
 			}
@@ -92,6 +94,8 @@ func (lc *LogController) ServeRequest(ws *ws.Conn) error {
 		select {
 		case n := <-notifyChan:
 			ws.WriteJSON(n)
+		case <-closeChan:
+			return nil
 		}
 	}
 
